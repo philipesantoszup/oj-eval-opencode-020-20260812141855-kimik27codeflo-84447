@@ -1,5 +1,8 @@
+CC = gcc
+override CFLAGS += -Wno-error
+
 .PHONY: all clean
 all:
-	gcc -o code main.c buddy.c
+	$(CC) $(CFLAGS) -o code main.c buddy.c
 clean:
-	rm -f code test
+	rm -f code test *.o
