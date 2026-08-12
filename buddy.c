@@ -6,12 +6,16 @@
 
 #define PAGE_SIZE   4096
 #define MAX_RANK    16
+#define NIL         (-1)
 
 static void *pool_start = NULL;
 static int   pool_pages = 0;
 static int   pool_max_rank = 0;
-static void *free_list[MAX_RANK + 1];
+static int   free_head[MAX_RANK + 1];
+static int   free_count[MAX_RANK + 1];
 static int8_t *page_rank = NULL;
+static int    *next_free = NULL;
+static int    *prev_free = NULL;
 
 static inline int ptr_to_page(void *p)
 {
@@ -28,39 +32,35 @@ static inline int block_pages(int rank)
     return 1 << (rank - 1);
 }
 
-static void add_to_free_list(int rank, void *block)
+static void add_to_free_list(int rank, int page)
 {
-    *(void **)block = free_list[rank];
-    free_list[rank] = block;
-}
-
-static void *remove_head(int rank)
-{
-    void *block = free_list[rank];
-    if (block) {
-        free_list[rank] = *(void **)block;
+    next_free[page] = free_head[rank];
+    if (free_head[rank] != NIL) {
+        prev_free[free_head[rank]] = page;
     }
-    return block;
+    prev_free[page] = NIL;
+    free_head[rank] = page;
+    page_rank[page] = (int8_t)(-rank);
+    free_count[rank]++;
 }
 
-static int remove_from_free_list(int rank, void *block)
+static void remove_from_free_list(int rank, int page)
 {
-    void **cur = &free_list[rank];
-    while (*cur) {
-        if (*cur == block) {
-            *cur = *(void **)*cur;
-            return 1;
-        }
-        cur = (void **)*cur;
+    if (prev_free[page] != NIL) {
+        next_free[prev_free[page]] = next_free[page];
+    } else {
+        free_head[rank] = next_free[page];
     }
-    return 0;
+    if (next_free[page] != NIL) {
+        prev_free[next_free[page]] = prev_free[page];
+    }
+    page_rank[page] = 0;
+    free_count[rank]--;
 }
 
-static inline void *buddy_addr(void *p, int rank)
+static inline int buddy_page(int page, int rank)
 {
-    int page = ptr_to_page(p);
-    int buddy_page = page ^ block_pages(rank);
-    return page_to_ptr(buddy_page);
+    return page ^ block_pages(rank);
 }
 
 int init_page(void *p, int pgcount)
@@ -77,25 +77,29 @@ int init_page(void *p, int pgcount)
         pool_max_rank++;
     }
 
-    if (page_rank) {
-        free(page_rank);
-    }
+    if (page_rank) free(page_rank);
+    if (next_free) free(next_free);
+    if (prev_free) free(prev_free);
+
     page_rank = (int8_t *)malloc(pgcount * sizeof(int8_t));
-    if (!page_rank) {
+    next_free = (int *)malloc(pgcount * sizeof(int));
+    prev_free = (int *)malloc(pgcount * sizeof(int));
+    if (!page_rank || !next_free || !prev_free) {
         return ENOSPC;
     }
-    memset(page_rank, 0, pgcount * sizeof(int8_t));
 
-    memset(free_list, 0, sizeof(free_list));
+    memset(page_rank, 0, pgcount * sizeof(int8_t));
+    memset(next_free, 0xff, pgcount * sizeof(int));
+    memset(prev_free, 0xff, pgcount * sizeof(int));
+    memset(free_head, 0xff, sizeof(free_head));
+    memset(free_count, 0, sizeof(free_count));
 
     int page = 0;
     int remaining = pgcount;
     for (int r = pool_max_rank; r >= 1; r--) {
         int size = block_pages(r);
         while (remaining >= size) {
-            void *block = page_to_ptr(page);
-            add_to_free_list(r, block);
-            page_rank[page] = (int8_t)(-r);
+            add_to_free_list(r, page);
             page += size;
             remaining -= size;
         }
@@ -114,28 +118,25 @@ void *alloc_pages(int rank)
     }
 
     int chosen_rank = rank;
-    while (chosen_rank <= pool_max_rank && !free_list[chosen_rank]) {
+    while (chosen_rank <= pool_max_rank && free_head[chosen_rank] == NIL) {
         chosen_rank++;
     }
     if (chosen_rank > pool_max_rank) {
         return ERR_PTR(-ENOSPC);
     }
 
-    void *block = remove_head(chosen_rank);
-    int page = ptr_to_page(block);
-    page_rank[page] = 0;
+    int page = free_head[chosen_rank];
+    remove_from_free_list(chosen_rank, page);
 
     while (chosen_rank > rank) {
         int half_rank = chosen_rank - 1;
         int half_pages = block_pages(half_rank);
-        void *buddy = page_to_ptr(page + half_pages);
-        add_to_free_list(half_rank, buddy);
-        page_rank[page + half_pages] = (int8_t)(-half_rank);
+        add_to_free_list(half_rank, page + half_pages);
         chosen_rank = half_rank;
     }
 
     page_rank[page] = (int8_t)rank;
-    return block;
+    return page_to_ptr(page);
 }
 
 int return_pages(void *p)
@@ -159,30 +160,23 @@ int return_pages(void *p)
 
     int rank = (int)page_rank[page];
     page_rank[page] = 0;
-    void *block = p;
 
     while (rank < pool_max_rank) {
-        void *buddy = buddy_addr(block, rank);
-        int buddy_page = ptr_to_page(buddy);
-        if (buddy_page < 0 || buddy_page >= pool_pages) {
+        int buddy = buddy_page(page, rank);
+        if (buddy < 0 || buddy >= pool_pages) {
             break;
         }
-        if (page_rank[buddy_page] != (int8_t)(-rank)) {
+        if (page_rank[buddy] != (int8_t)(-rank)) {
             break;
         }
-        if (!remove_from_free_list(rank, buddy)) {
-            break;
-        }
-        page_rank[buddy_page] = 0;
-        if (buddy < block) {
-            block = buddy;
-            page = buddy_page;
+        remove_from_free_list(rank, buddy);
+        if (buddy < page) {
+            page = buddy;
         }
         rank++;
     }
 
-    page_rank[page] = (int8_t)(-rank);
-    add_to_free_list(rank, block);
+    add_to_free_list(rank, page);
     return OK;
 }
 
@@ -228,12 +222,5 @@ int query_page_counts(int rank)
     if (!pool_start) {
         return 0;
     }
-
-    int count = 0;
-    void *p = free_list[rank];
-    while (p) {
-        count++;
-        p = *(void **)p;
-    }
-    return count;
+    return free_count[rank];
 }
