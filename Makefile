@@ -1,5 +1,5 @@
 CC = gcc
-override CFLAGS += -Wno-error
+override CFLAGS += -w
 
 .PHONY: all clean
 all:
